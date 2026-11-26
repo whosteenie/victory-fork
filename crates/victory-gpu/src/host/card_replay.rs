@@ -2,38 +2,21 @@
 
 use std::time::Instant;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-
-use super::*;
+use super::{
+    replay_context::{CommandReplay, micros},
+    *,
+};
 use crate::shadow::{CardSpan, joined_piece_runs};
 
 const PIECE: u32 = 65536;
 const UNCHANGED_FLAG: u32 = 0xdead_beef;
 type Pipeline = (ID3D12RootSignature, ID3D12PipelineState);
 
-struct Event(HANDLE);
-
-impl Drop for Event {
-    fn drop(&mut self) {
-        // SAFETY: this fixture owns the event.
-        unsafe {
-            let _ = CloseHandle(self.0);
-        }
-    }
-}
-
 struct Replay {
-    queue: ID3D12CommandQueue,
-    allocator: ID3D12CommandAllocator,
-    list: ID3D12GraphicsCommandList,
-    fence: ID3D12Fence,
-    event: Event,
-    next: u64,
+    commands: CommandReplay,
     query: ID3D12QueryHeap,
     ticks: ID3D12Resource,
     tick_data: *mut u8,
-    frequency: f64,
     pipeline: [Pipeline; 2],
     input: ID3D12Resource,
     upload: ID3D12Resource,
@@ -50,24 +33,9 @@ impl Replay {
         let pipeline = [false, true]
             .map(|wide| make_card_compare(device, wide).expect("production hash pipeline"));
         let mut query = None;
-        // SAFETY: every D3D12 object created here belongs to this fixture.
-        let (queue, allocator, list, fence, event, frequency) = unsafe {
-            let queue: ID3D12CommandQueue = device
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .unwrap();
-            let allocator: ID3D12CommandAllocator = device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                .unwrap();
-            let list: ID3D12GraphicsCommandList = device
-                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
-                .unwrap();
-            list.Close().unwrap();
-            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-            let event = Event(CreateEventW(None, false, false, None).unwrap());
-            let frequency = queue.GetTimestampFrequency().unwrap() as f64;
+        let commands = CommandReplay::new(device);
+        // SAFETY: the heap is owned by this fixture and the output pointer is valid.
+        unsafe {
             device
                 .CreateQueryHeap(
                     &D3D12_QUERY_HEAP_DESC {
@@ -78,8 +46,7 @@ impl Replay {
                     &mut query,
                 )
                 .unwrap();
-            (queue, allocator, list, fence, event, frequency)
-        };
+        }
         let (upload, upload_data) = host.upload_buffer(u64::from(bytes) + 16).unwrap();
         let input = host.uav_buffer(u64::from(bytes)).unwrap();
         let hashes = host.uav_buffer(u64::from(pieces) * 16).unwrap();
@@ -103,16 +70,10 @@ impl Replay {
                 .fill(UNCHANGED_FLAG);
         }
         let mut replay = Self {
-            queue,
-            allocator,
-            list,
-            fence,
-            event,
-            next: 0,
+            commands,
             query: query.unwrap(),
             ticks,
             tick_data,
-            frequency,
             pipeline,
             input,
             upload,
@@ -121,65 +82,35 @@ impl Replay {
             flags_data,
             flag_words,
         };
-        replay.begin();
+        replay.commands.begin();
         // SAFETY: the newly allocated input is COMMON and only this list uses it.
         unsafe {
-            replay
-                .list
-                .CopyBufferRegion(&replay.input, 0, &replay.upload, 0, u64::from(bytes));
+            replay.commands.list.CopyBufferRegion(
+                &replay.input,
+                0,
+                &replay.upload,
+                0,
+                u64::from(bytes),
+            );
         }
-        replay.submit();
+        replay.commands.submit();
         replay
-    }
-
-    fn begin(&self) {
-        // SAFETY: submit waited for the preceding use of this allocator.
-        unsafe {
-            self.allocator.Reset().unwrap();
-            self.list.Reset(&self.allocator, None).unwrap();
-        }
-    }
-
-    fn submit(&mut self) -> (f64, f64) {
-        let start = Instant::now();
-        self.next += 1;
-        // SAFETY: the closed list is this allocator's only work, and resources
-        // stay live until the fence signals. A timed-out test aborts the sample.
-        unsafe {
-            self.list.Close().unwrap();
-            self.queue
-                .ExecuteCommandLists(&[Some(self.list.cast().unwrap())]);
-            self.queue.Signal(&self.fence, self.next).unwrap();
-            let submit = micros(start);
-            let waiting = Instant::now();
-            self.fence
-                .SetEventOnCompletion(self.next, self.event.0)
-                .unwrap();
-            assert_eq!(
-                WaitForSingleObject(self.event.0, 30_000),
-                WAIT_OBJECT_0,
-                "GPU fence timeout"
-            );
-            assert_eq!(
-                self.fence.GetCompletedValue(),
-                self.next,
-                "GPU fence/device failure"
-            );
-            (submit, micros(waiting))
-        }
     }
 
     fn bind(&self, wide: bool) {
         let (root, pso) = &self.pipeline[usize::from(wide)];
         // SAFETY: this list is recording and the bindings match the production root signature.
         unsafe {
-            self.list.SetComputeRootSignature(root);
-            self.list.SetPipelineState(pso);
-            self.list
+            self.commands.list.SetComputeRootSignature(root);
+            self.commands.list.SetPipelineState(pso);
+            self.commands
+                .list
                 .SetComputeRootShaderResourceView(1, self.input.GetGPUVirtualAddress());
-            self.list
+            self.commands
+                .list
                 .SetComputeRootUnorderedAccessView(2, self.hashes.GetGPUVirtualAddress());
-            self.list
+            self.commands
+                .list
                 .SetComputeRootUnorderedAccessView(3, self.flags.GetGPUVirtualAddress());
         }
     }
@@ -188,9 +119,11 @@ impl Replay {
         // SAFETY: the production root signature accepts all six constants, and
         // the caller's span and output offset fit the fixture's buffers.
         unsafe {
-            self.list
+            self.commands
+                .list
                 .SetComputeRoot32BitConstants(0, 6, words.as_ptr().cast(), 0);
-            self.list
+            self.commands
+                .list
                 .Dispatch(card_compare_groups(wide, words[3]), 1, 1);
         }
     }
@@ -199,9 +132,10 @@ impl Replay {
         // SAFETY: this list starts with COMMON input, promoted by the copy.
         // The following shader reads that same resource in its transitioned state.
         unsafe {
-            self.list
+            self.commands
+                .list
                 .CopyBufferRegion(&self.input, to, &self.upload, from, len);
-            self.list.ResourceBarrier(&[transition(
+            self.commands.list.ResourceBarrier(&[transition(
                 &self.input,
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -212,7 +146,8 @@ impl Replay {
     fn input_state(&self, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
         // SAFETY: updates the whole live input buffer during this recording.
         unsafe {
-            self.list
+            self.commands
+                .list
                 .ResourceBarrier(&[transition(&self.input, before, after)]);
         }
     }
@@ -229,7 +164,15 @@ impl Replay {
         };
         // SAFETY: this orders earlier UAV writes before the next hash readers/writers.
         unsafe {
-            self.list.ResourceBarrier(&[barrier]);
+            self.commands.list.ResourceBarrier(&[barrier]);
+        }
+    }
+
+    fn reset_flags(&self) {
+        // SAFETY: each prior submission is fenced before this CPU write.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.flags_data.cast::<u32>(), self.flag_words)
+                .fill(UNCHANGED_FLAG);
         }
     }
 
@@ -241,20 +184,18 @@ impl Replay {
     fn hash_words(&mut self, pieces: u32) -> Vec<[u32; 4]> {
         let n = u64::from(pieces) * 16;
         let (readback, data) = host().unwrap().shared_buffer(n).unwrap();
-        self.begin();
+        self.commands.begin();
         // SAFETY: separate execution with both buffers in COMMON, and the
         // source and destination ranges contain exactly n bytes.
         unsafe {
-            self.list.CopyBufferRegion(&readback, 0, &self.hashes, 0, n);
+            self.commands
+                .list
+                .CopyBufferRegion(&readback, 0, &self.hashes, 0, n);
         }
-        self.submit();
+        self.commands.submit();
         // SAFETY: the readback fence has completed before the mapped read.
         unsafe { std::slice::from_raw_parts(data.cast::<[u32; 4]>(), pieces as usize).to_vec() }
     }
-}
-
-fn micros(since: Instant) -> f64 {
-    since.elapsed().as_secs_f64() * 1_000_000.0
 }
 
 /// CPU reference over an independently generated input. The modes have
@@ -307,34 +248,69 @@ fn parity() {
         let after = (0..3)
             .map(|i| reference(&updated, i, SKEW, SIZE, wide))
             .collect::<Vec<_>>();
-        rig.begin();
+        rig.commands.begin();
         rig.copy_input(0, 0, u64::from(BYTES));
         rig.bind(wide);
         rig.dispatch(wide, [0, SKEW, SIZE, 3, 4, 0]);
-        rig.submit();
+        rig.commands.submit();
         assert_eq!(rig.hash_words(3), expected);
-        rig.begin();
+        rig.commands.begin();
         rig.copy_input(u64::from(BYTES), 0, 16);
         rig.bind(wide);
         rig.dispatch(wide, [0, SKEW, SIZE, 3, 4, 1]);
-        rig.submit();
+        rig.commands.submit();
         assert_eq!(rig.flags(), &[UNCHANGED_FLAG, 1, 0, 0, UNCHANGED_FLAG]);
         assert_eq!(
             rig.hash_words(3),
             expected,
             "compare-only changed a stored hash"
         );
-        rig.begin();
+        rig.commands.begin();
         rig.bind(wide);
         rig.dispatch(wide, [0, SKEW, SIZE, 3, 4, 2]);
-        rig.submit();
+        rig.commands.submit();
         assert_eq!(rig.flags(), &[UNCHANGED_FLAG, 1, 0, 0, UNCHANGED_FLAG]);
         assert_eq!(rig.hash_words(3), after);
-        rig.begin();
+        rig.commands.begin();
         rig.bind(wide);
         rig.dispatch(wide, [0, SKEW, SIZE, 3, 4, 1]);
-        rig.submit();
+        rig.commands.submit();
         assert_eq!(rig.flags(), &[UNCHANGED_FLAG, 0, 0, 0, UNCHANGED_FLAG]);
+    }
+    assert_debug_clean();
+}
+
+fn assert_debug_clean() {
+    if !std::env::var_os("VICTORY_D3D12_DEBUG").is_some_and(|value| value == "1") {
+        return;
+    }
+    let device = host().unwrap().device();
+    let queue = device
+        .cast::<ID3D12InfoQueue>()
+        .expect("D3D12 debug layer requested");
+    // SAFETY: the queue reports the required size and the u64 storage
+    // provides alignment for the message. Messages are live until cleared.
+    unsafe {
+        for index in 0..queue.GetNumStoredMessages() {
+            let mut bytes = 0;
+            queue.GetMessage(index, None, &mut bytes).unwrap();
+            let mut storage = vec![0u64; bytes.div_ceil(8)];
+            let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            queue.GetMessage(index, Some(message), &mut bytes).unwrap();
+            let message = &*message;
+            assert!(
+                message.Severity != D3D12_MESSAGE_SEVERITY_ERROR
+                    && message.Severity != D3D12_MESSAGE_SEVERITY_CORRUPTION,
+                "D3D12 debug validation failed (message id {}): {}",
+                message.ID.0,
+                String::from_utf8_lossy(std::slice::from_raw_parts(
+                    message.pDescription,
+                    message.DescriptionByteLength
+                ))
+                .trim_end_matches('\0'),
+            );
+        }
+        queue.ClearStoredMessages();
     }
 }
 
@@ -430,22 +406,37 @@ fn replay_card_hashes() {
     for round in 0..rounds + 2 {
         for position in 0..modes.len() {
             let (mode, wide, rehash) = modes[(round + position) % modes.len()];
+            let preparing = Instant::now();
+            rig.reset_flags();
             // The stored representation belongs to this mode. Seed all pieces
             // before timing so neither another mode nor an earlier round can
             // supply its hash words.
-            rig.begin();
+            rig.commands.begin();
+            // Restore both records that a previous sample may have edited.
+            // SAFETY: a fresh list promotes COMMON input to COPY_DEST.
+            unsafe {
+                rig.commands.list.CopyBufferRegion(
+                    &rig.input,
+                    u64::from(PIECE),
+                    &rig.upload,
+                    u64::from(PIECE),
+                    16,
+                );
+            }
             rig.copy_input(0, 0, 16);
             rig.bind(wide);
             rig.dispatch(wide, [0, 0, BYTES, PIECES, 0, 0]);
-            rig.submit();
+            rig.commands.submit();
 
+            let prepare = micros(preparing);
             let started = Instant::now();
-            rig.begin();
+            rig.commands.begin();
             // SAFETY: all four queries are resolved after the two timed command ranges.
             unsafe {
-                rig.list.EndQuery(&rig.query, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                rig.commands
+                    .list
+                    .EndQuery(&rig.query, D3D12_QUERY_TYPE_TIMESTAMP, 0);
             }
-            rig.bind(wide);
             for (index, (upload, hashes)) in flights.iter().zip(rehash).enumerate() {
                 if index != 0 {
                     rig.input_state(
@@ -454,15 +445,26 @@ fn replay_card_hashes() {
                     );
                 }
                 for span in upload {
-                    // SAFETY: COPY_DEST, implicit on the first upload, with
-                    // the same byte copies in all three variants.
+                    // SAFETY: COPY_DEST, implicit on the first upload. Replace
+                    // the first record of piece 1 without overlapping copies.
                     unsafe {
-                        rig.list.CopyBufferRegion(
+                        let mut from = u64::from(span.from);
+                        if span.from == PIECE {
+                            rig.commands.list.CopyBufferRegion(
+                                &rig.input,
+                                from,
+                                &rig.upload,
+                                u64::from(BYTES),
+                                16,
+                            );
+                            from += 16;
+                        }
+                        rig.commands.list.CopyBufferRegion(
                             &rig.input,
-                            u64::from(span.from),
+                            from,
                             &rig.upload,
-                            u64::from(span.from),
-                            u64::from(span.to - span.from),
+                            from,
+                            u64::from(span.to) - from,
                         );
                     }
                 }
@@ -470,6 +472,9 @@ fn replay_card_hashes() {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 );
+                // The production SRV's data is static while set at execution.
+                // Every intervening copy establishes a new binding interval.
+                rig.bind(wide);
                 for span in hashes {
                     rig.dispatch(wide, [span.first, span.skew, BYTES, span.pieces, 0, 0]);
                 }
@@ -478,15 +483,20 @@ fn replay_card_hashes() {
             rig.order_hashes();
             // SAFETY: this end query follows all the rehash groups.
             unsafe {
-                rig.list.EndQuery(&rig.query, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                rig.commands
+                    .list
+                    .EndQuery(&rig.query, D3D12_QUERY_TYPE_TIMESTAMP, 1);
             }
             rig.input_state(
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             );
             rig.copy_input(u64::from(BYTES), 0, 16);
+            rig.bind(wide);
             unsafe {
-                rig.list.EndQuery(&rig.query, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+                rig.commands
+                    .list
+                    .EndQuery(&rig.query, D3D12_QUERY_TYPE_TIMESTAMP, 2);
             }
             let chunk = PIECES / COMPARE_SPANS;
             for sweep in 0..COMPARE_SWEEPS {
@@ -497,8 +507,10 @@ fn replay_card_hashes() {
                 rig.order_hashes();
             }
             unsafe {
-                rig.list.EndQuery(&rig.query, D3D12_QUERY_TYPE_TIMESTAMP, 3);
-                rig.list.ResolveQueryData(
+                rig.commands
+                    .list
+                    .EndQuery(&rig.query, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+                rig.commands.list.ResolveQueryData(
                     &rig.query,
                     D3D12_QUERY_TYPE_TIMESTAMP,
                     0,
@@ -508,7 +520,7 @@ fn replay_card_hashes() {
                 );
             }
             let record = micros(started);
-            let (submit, wait) = rig.submit();
+            let (submit, wait) = rig.commands.submit();
             // SAFETY: fence completed before the query/result mappings are read.
             let [a, b, c, d] = unsafe { rig.tick_data.cast::<[u64; 4]>().read() };
             assert!(a < b && b <= c && c < d, "invalid GPU timestamps");
@@ -517,17 +529,31 @@ fn replay_card_hashes() {
                 1,
                 "the GPU edit must be found on its first comparison"
             );
+            assert_eq!(
+                rig.flags()[1],
+                0,
+                "the upload must be included in the rehash"
+            );
             assert!(
                 rig.flags()[1..].iter().all(|&flag| flag == 0),
                 "advancing hash or unchanged piece mismatch"
             );
-            let ticks_us = |delta| delta as f64 * 1_000_000.0 / rig.frequency;
+            let ticks_us = |delta| delta as f64 * 1_000_000.0 / rig.commands.frequency;
             println!(
-                r#"{{"kind":"sample","mode":"{mode}","round":{round},"warmup":{},"record_us":{record:.1},"submit_us":{submit:.1},"wait_us":{wait:.1},"upload_hash_us":{:.1},"compare_us":{:.1},"checked_flags":{COMPARE_PIECES}}}"#,
+                r#"{{"kind":"sample","mode":"{mode}","round":{round},"warmup":{},"prepare_us":{prepare:.1},"record_us":{record:.1},"submit_us":{submit:.1},"wait_us":{wait:.1},"upload_hash_us":{:.1},"compare_us":{:.1},"checked_flags":{COMPARE_PIECES}}}"#,
                 round < 2,
                 ticks_us(b - a),
                 ticks_us(d - c)
             );
         }
     }
+    assert_debug_clean();
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+#[ignore = "local automatic capture with the optional RenderDoc DLL"]
+fn capture_card_hash_parity() {
+    let device = host().expect("hardware D3D12 device").device();
+    crate::renderdoc::capture_test_sequence(device, parity);
 }

@@ -1691,6 +1691,7 @@ void main() {
         );
         // Inactive slot 3 was never copied from `src_args`.
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
+        println!(r#"{{"kind":"check","check":"counted_indirect","executed_groups":{expected_groups}}}"#);
     }
 
     /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned

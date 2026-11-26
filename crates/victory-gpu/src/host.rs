@@ -2115,6 +2115,9 @@ fn make_card_compare(
 #[cfg(test)]
 mod card_replay;
 
+#[cfg(test)]
+pub(crate) mod replay_context;
+
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
 /// only with [`relay`]).

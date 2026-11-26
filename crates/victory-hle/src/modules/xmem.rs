@@ -1115,7 +1115,7 @@ mod tests {
         assert_eq!(notified, Some((at as usize, PAGE)));
     }
 
-    fn query(address: *const c_void) -> BasicInformation {
+    pub(super) fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
         let mut info: BasicInformation = unsafe { std::mem::zeroed() };
         // SAFETY: a pseudo handle needs no closing.
@@ -1534,3 +1534,6 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
 }
+
+#[cfg(test)]
+mod replay;

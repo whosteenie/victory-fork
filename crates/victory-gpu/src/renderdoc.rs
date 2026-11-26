@@ -152,3 +152,25 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
         tracing::info!(captures, "RenderDoc captures made so far");
     }
 }
+
+/// Captures a fence-completed standalone test sequence without a swap chain.
+#[cfg(test)]
+pub(crate) fn capture_test_sequence(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device, run: impl FnOnce()) {
+    use windows::core::Interface;
+    const START_FRAME_CAPTURE: usize = 19;
+    const END_FRAME_CAPTURE: usize = 21;
+    let api = API.get().and_then(Option::as_ref).expect("set VICTORY_RENDERDOC to the official DLL");
+    let device = device.as_raw();
+    let window = std::ptr::null_mut();
+    // SAFETY: RenderDoc 1.1.2 API entries and the live wrapped D3D12 device.
+    unsafe {
+        let start = api.entry::<unsafe extern "C" fn(*mut c_void, *mut c_void)>(START_FRAME_CAPTURE);
+        let end = api.entry::<unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32>(END_FRAME_CAPTURE);
+        let count = api.entry::<unsafe extern "C" fn() -> u32>(GET_NUM_CAPTURES);
+        let before = count();
+        start(device, window);
+        run();
+        assert_eq!(end(device, window), 1, "RenderDoc failed to capture the sequence");
+        assert_eq!(count(), before + 1);
+    }
+}
